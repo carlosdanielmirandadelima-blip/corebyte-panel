@@ -1,0 +1,542 @@
+# Cole este bloco inteiro no terminal do Play with Docker e aperte Enter
+cat << 'SCRIPT' > install.sh && chmod +x install.sh && ./install.sh
+#!/bin/bash
+set -e
+
+echo "============================================"
+echo "  CoreByte Cloud Panel - Instalação"
+echo "  CoreByte Tecnologia"
+echo "============================================"
+
+# Configurar diretório
+mkdir -p /opt/corebyte-panel/data
+cd /opt/corebyte-panel
+
+# Criar todos os arquivos (docker-compose, Dockerfile, etc.)
+cat > docker-compose.yml <<'DOCKEREOF'
+version: "3.8"
+services:
+  corebyte-panel:
+    build: .
+    container_name: corebyte-panel
+    ports:
+      - "3000:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+    environment:
+      - NEXTAUTH_SECRET=corebyte-secret-change-in-production
+      - NEXTAUTH_URL=http://localhost:3000
+      - DATABASE_URL=file:/app/data/corebyte.db
+    restart: unless-stopped
+DOCKEREOF
+
+cat > Dockerfile <<'DOCKEREOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json ./
+RUN npm install --production=false
+COPY . .
+RUN npx prisma generate
+RUN npm run build
+EXPOSE 3000
+CMD ["npm", "start"]
+DOCKEREOF
+
+cat > package.json <<'PKGEOF'
+{
+  "name": "corebyte-panel",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.17.0",
+    "bcryptjs": "^2.4.3",
+    "dockerode": "^4.0.2",
+    "next": "14.2.5",
+    "next-auth": "^4.24.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.6",
+    "postcss": "^8.4.40",
+    "autoprefixer": "^10.4.19"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/dockerode": "^3.3.27",
+    "@types/node": "^20.14.13",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "prisma": "^5.17.0",
+    "typescript": "^5.5.4"
+  }
+}
+PKGEOF
+
+cat > tsconfig.json <<'TSCEOF'
+{
+  "compilerOptions": {
+    "target": "es5",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "paths": { "@/*": ["./*"] }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+TSCEOF
+
+cat > next.config.js <<'NEXTEOF'
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: {
+    serverComponentsExternalPackages: ["dockerode"],
+  },
+};
+module.exports = nextConfig;
+NEXTEOF
+
+cat > tailwind.config.ts <<'TAILEOF'
+import type { Config } from "tailwindcss";
+const config: Config = {
+  content: ["./components/**/*.{js,ts,jsx,tsx,mdx}", "./app/**/*.{js,ts,jsx,tsx,mdx}"],
+  theme: {
+    extend: {
+      colors: {
+        coreblue: "#00a8ff",
+        coredark: "#0a0a1a",
+      },
+    },
+  },
+  plugins: [],
+};
+export default config;
+TAILEOF
+
+cat > postcss.config.js <<'PCSSEOF'
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+PCSSEOF
+
+mkdir -p prisma
+cat > prisma/schema.prisma <<'PRISEOF'
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+model User {
+  id       String @id @default(cuid())
+  username String @unique
+  password String
+}
+PRISEOF
+
+mkdir -p lib
+cat > lib/prisma.ts <<'LIBPEOF'
+import { PrismaClient } from "@prisma/client";
+const globalForPrisma = globalThis as unknown as { prisma: PrismaClient };
+export const prisma = globalForPrisma.prisma || new PrismaClient();
+if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+LIBPEOF
+
+cat > lib/docker.ts <<'DOCKTEOF'
+import Docker from "dockerode";
+const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+
+export async function listContainers() {
+  const containers = await docker.listContainers({ all: true });
+  return containers.map((c) => ({
+    id: c.Id,
+    name: c.Names[0]?.replace("/", "") || c.Id.substring(0, 8),
+    image: c.Image,
+    state: c.State,
+    status: c.Status,
+    ports: c.Ports.map((p) => ({
+      ip: p.IP,
+      privatePort: p.PrivatePort,
+      publicPort: p.PublicPort,
+      type: p.Type,
+    })),
+  }));
+}
+
+export async function containerLogs(id: string) {
+  const container = docker.getContainer(id);
+  const logStream = await container.logs({ stdout: true, stderr: true, tail: 50 });
+  return logStream.toString("utf-8");
+}
+
+export async function containerAction(id: string, action: "start" | "stop" | "restart") {
+  const container = docker.getContainer(id);
+  await (container as any)[action]();
+}
+DOCKTEOF
+
+cat > lib/auth.ts <<'AUTHEOF'
+import CredentialsProvider from "next-auth/providers/credentials";
+import { prisma } from "./prisma";
+import bcrypt from "bcryptjs";
+
+export const authOptions = {
+  providers: [
+    CredentialsProvider({
+      name: "credentials",
+      credentials: {
+        username: { label: "Usuário", type: "text" },
+        password: { label: "Senha", type: "password" },
+      },
+      async authorize(credentials) {
+        if (!credentials?.username || !credentials?.password) return null;
+        const user = await prisma.user.findUnique({ where: { username: credentials.username } });
+        if (!user) return null;
+        const valid = await bcrypt.compare(credentials.password, user.password);
+        if (!valid) return null;
+        return { id: user.id, name: user.username };
+      },
+    }),
+  ],
+  session: { strategy: "jwt" as const },
+  pages: { signIn: "/login" },
+  secret: process.env.NEXTAUTH_SECRET,
+};
+AUTHEOF
+
+cat > lib/types.ts <<'TYPEEOF'
+export interface ContainerPort {
+  ip: string;
+  privatePort: number;
+  publicPort?: number;
+  type: string;
+}
+export interface Container {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  status: string;
+  ports: ContainerPort[];
+}
+TYPEEOF
+
+mkdir -p app/api/auth/\[...nextauth\]
+cat > app/api/auth/\[...nextauth\]/route.ts <<'AUTHAPIOF'
+import NextAuth from "next-auth";
+import { authOptions } from "@/lib/auth";
+const handler = NextAuth(authOptions);
+export { handler as GET, handler as POST };
+AUTHAPIOF
+
+mkdir -p app/api/containers/\[id\]/logs
+cat > app/api/containers/route.ts <<'CONTAINERGETEOF'
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { listContainers } from "@/lib/docker";
+import { NextResponse } from "next/server";
+
+export async function GET() {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const containers = await listContainers();
+  return NextResponse.json(containers);
+}
+CONTAINERGETEOF
+
+cat > app/api/containers/\[id\]/route.ts <<'CONTAINERACTIONEOF'
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { containerAction } from "@/lib/docker";
+import { NextResponse } from "next/server";
+
+export async function POST(request: Request, { params }: { params: { id: string } }) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const { action } = await request.json();
+  if (!["start", "stop", "restart"].includes(action)) {
+    return NextResponse.json({ error: "Invalid action" }, { status: 400 });
+  }
+  await containerAction(params.id, action);
+  return NextResponse.json({ success: true });
+}
+CONTAINERACTIONEOF
+
+cat > app/api/containers/\[id\]/logs/route.ts <<'LOGSEOF'
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { containerLogs } from "@/lib/docker";
+import { NextResponse } from "next/server";
+
+export async function GET(request: Request, { params }: { params: { id: string } }) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const logs = await containerLogs(params.id);
+  return NextResponse.json({ logs });
+}
+LOGSEOF
+
+cat > app/globals.css <<'CSSEOF'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+body {
+  background-color: #0a0a1a;
+  color: #e2e8f0;
+}
+.corebyte-footer {
+  position: fixed;
+  bottom: 0;
+  right: 0;
+  padding: 8px 16px;
+  background: rgba(10, 10, 26, 0.8);
+  backdrop-filter: blur(10px);
+  border-top-left-radius: 8px;
+  color: #00a8ff;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  z-index: 50;
+}
+CSSEOF
+
+cat > app/layout.tsx <<'LAYOUTEOF'
+import "./globals.css";
+import { Providers } from "./providers";
+export const metadata = {
+  title: "CoreByte Cloud",
+  description: "Painel de gerenciamento de containers",
+};
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="pt-BR">
+      <body className="min-h-screen flex flex-col">
+        <Providers>{children}</Providers>
+        <div className="corebyte-footer">
+          <span>CoreByte Tecnologia</span>
+        </div>
+      </body>
+    </html>
+  );
+}
+LAYOUTEOF
+
+cat > app/providers.tsx <<'PROVEOF'
+"use client";
+import { SessionProvider } from "next-auth/react";
+export function Providers({ children }: { children: React.ReactNode }) {
+  return <SessionProvider>{children}</SessionProvider>;
+}
+PROVEOF
+
+mkdir -p app/login
+cat > app/login/page.tsx <<'LOGINEOF'
+"use client";
+import { useState } from "react";
+import { signIn } from "next-auth/react";
+import { useRouter } from "next/navigation";
+
+export default function LoginPage() {
+  const router = useRouter();
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    const result = await signIn("credentials", { username, password, redirect: false });
+    if (result?.error) {
+      setError("Credenciais inválidas");
+    } else {
+      router.push("/dashboard");
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center">
+      <form onSubmit={handleSubmit} className="bg-gray-900/80 backdrop-blur p-8 rounded-xl border border-coreblue/30 shadow-xl w-full max-w-md">
+        <h1 className="text-3xl font-bold text-center text-coreblue mb-2">CoreByte Cloud</h1>
+        <p className="text-center text-gray-400 mb-6">Acesse seu painel</p>
+        {error && <div className="bg-red-500/20 text-red-400 p-3 rounded mb-4 text-sm">{error}</div>}
+        <div className="mb-4">
+          <label className="block text-sm text-gray-400 mb-1">Usuário</label>
+          <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} className="w-full bg-black/50 border border-gray-700 rounded-lg p-3 text-white focus:outline-none focus:border-coreblue" required />
+        </div>
+        <div className="mb-6">
+          <label className="block text-sm text-gray-400 mb-1">Senha</label>
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} className="w-full bg-black/50 border border-gray-700 rounded-lg p-3 text-white focus:outline-none focus:border-coreblue" required />
+        </div>
+        <button type="submit" className="w-full bg-coreblue hover:bg-blue-600 text-white font-bold py-3 rounded-lg transition-colors">Entrar</button>
+      </form>
+    </div>
+  );
+}
+LOGINEOF
+
+mkdir -p app/dashboard
+cat > app/dashboard/layout.tsx <<'DASHLAYEOF'
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { redirect } from "next/navigation";
+
+export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
+  const session = await getServerSession(authOptions);
+  if (!session) redirect("/login");
+  return <>{children}</>;
+}
+DASHLAYEOF
+
+cat > app/dashboard/page.tsx <<'DASHPAGEOF'
+"use client";
+import { useEffect, useState } from "react";
+import { useSession, signOut } from "next-auth/react";
+import { Container } from "@/lib/types";
+
+export default function DashboardPage() {
+  const { data: session } = useSession();
+  const [containers, setContainers] = useState<Container[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedContainer, setSelectedContainer] = useState<string | null>(null);
+  const [logs, setLogs] = useState<string>("");
+
+  const fetchContainers = async () => {
+    const res = await fetch("/api/containers");
+    setContainers(await res.json());
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    fetchContainers();
+  }, []);
+
+  const handleAction = async (id: string, action: "start" | "stop" | "restart") => {
+    await fetch(`/api/containers/${id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    });
+    fetchContainers();
+  };
+
+  const viewLogs = async (id: string) => {
+    setSelectedContainer(id);
+    const res = await fetch(`/api/containers/${id}/logs`);
+    const data = await res.json();
+    setLogs(data.logs);
+  };
+
+  return (
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-6">
+        <div>
+          <h1 className="text-2xl font-bold">Bem-vindo, {session?.user?.name}</h1>
+          <p className="text-gray-400">Painel de Containers</p>
+        </div>
+        <button onClick={() => signOut()} className="px-4 py-2 bg-red-600/20 text-red-400 rounded-lg hover:bg-red-600/40">Sair</button>
+      </div>
+
+      {loading ? (
+        <div className="text-center py-12 text-gray-400">Carregando containers...</div>
+      ) : containers.length === 0 ? (
+        <div className="border border-dashed border-gray-700 rounded-xl p-12 text-center">
+          <h3 className="text-xl text-gray-400 mb-2">Nenhum container encontrado</h3>
+          <p className="text-gray-500">Crie containers Docker para vê-los aqui.</p>
+        </div>
+      ) : (
+        <div className="grid gap-4">
+          {containers.map((container) => (
+            <div key={container.id} className="bg-gray-900/60 border border-gray-700 rounded-lg p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-lg font-semibold">{container.name}</span>
+                    <span className={`px-2 py-0.5 text-xs rounded-full ${
+                      container.state === "running" ? "bg-green-500/20 text-green-400" :
+                      container.state === "exited" ? "bg-red-500/20 text-red-400" :
+                      "bg-yellow-500/20 text-yellow-400"
+                    }`}>{container.state}</span>
+                  </div>
+                  <p className="text-sm text-gray-400 mt-1">{container.image}</p>
+                </div>
+                <div className="flex gap-2">
+                  {container.state !== "running" ? (
+                    <button onClick={() => handleAction(container.id, "start")} className="px-3 py-1 bg-green-600/20 text-green-400 rounded">Start</button>
+                  ) : (
+                    <>
+                      <button onClick={() => handleAction(container.id, "stop")} className="px-3 py-1 bg-yellow-600/20 text-yellow-400 rounded">Stop</button>
+                      <button onClick={() => handleAction(container.id, "restart")} className="px-3 py-1 bg-blue-600/20 text-blue-400 rounded">Restart</button>
+                    </>
+                  )}
+                  <button onClick={() => viewLogs(container.id)} className="px-3 py-1 bg-purple-600/20 text-purple-400 rounded">Logs</button>
+                </div>
+              </div>
+              {selectedContainer === container.id && (
+                <div className="mt-4 bg-black/50 rounded p-3 max-h-48 overflow-auto">
+                  <pre className="text-xs text-gray-300">{logs || "Sem logs disponíveis"}</pre>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+DASHPAGEOF
+
+# Instalar dependências e configurar
+npm install --legacy-peer-deps
+npx prisma db push
+
+# Criar usuário admin
+cat > seed.ts <<'SEEDEOF'
+import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
+const prisma = new PrismaClient();
+async function main() {
+  const hashed = await bcrypt.hash('corebyte123', 10);
+  await prisma.user.upsert({
+    where: { username: 'admin' },
+    update: {},
+    create: { username: 'admin', password: hashed },
+  });
+  console.log('Usuário admin criado: admin / corebyte123');
+}
+main().catch(console.error).finally(() => prisma.$disconnect());
+SEEDEOF
+
+npx tsx seed.ts
+
+# Build e iniciar
+docker-compose up -d --build
+
+echo ""
+echo "============================================"
+echo "  Instalação concluída!"
+echo "  CoreByte Cloud Panel"
+echo "  Acesse: http://localhost:3000"
+echo "  Login: admin"
+echo "  Senha: corebyte123"
+echo "============================================"
+SCRIPT
