@@ -1,0 +1,7 @@
+# Dependências Python minimalistas para Termux
+# Apenas bibliotecas padrão!
+
+# Não requer nenhuma dependência pip!
+# Python 3.11+ já tem tudo: http.server, sqlite3, subprocess, json
+# uvicorn>=0.27.0
+# Mais leve: http.server nativo do Python
